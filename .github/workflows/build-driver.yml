@@ -10,6 +10,10 @@ on:
         required: false
         default: all
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: ${{ matrix.target }}
@@ -44,19 +48,6 @@ jobs:
         with:
           submodules: true
 
-      - name: Cache kernel sources
-        uses: actions/cache@v4
-        with:
-          path: |
-            /root/6.12-Android16
-            /root/6.6-Android15
-            /root/6.1-Android14
-            /root/5.15-Android13
-            /root/5.10-Android13
-            /root/5.10-Android12
-          key: kernels-${{ hashFiles('lsdriver/Makefile') }}
-          restore-keys: kernels-
-
       - name: Build module
         shell: bash
         working-directory: lsdriver
@@ -72,16 +63,3 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
           retention-days: 30
-
-      - name: Upload to Releases
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v1
-        with:
-          files: '*.ko'
-          tag_name: ${{ github.sha }}
-          overwrite: true
-          fail_on_unreleased: false
-          body: |
-            **lsdriver** compiled for:
-            - ${{ matrix.target }}
-            - Commit: ${{ github.sha }}
