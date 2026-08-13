@@ -88,6 +88,15 @@ static int DispatchThreadFunction(void *data)
                 case request_op_vmem_info:
                     req->status = virtual_memory_enum(req->tgid, &req->vmem_info);
                     break;
+                case request_op_shadow_hook_add:
+                    req->status = ls_shadow_add_exec_hook(req->tgid, &req->shadow_hook_info);
+                    break;
+                case request_op_shadow_hook_del:
+                    req->status = ls_shadow_remove_exec_hook(req->tgid, req->shadow_hook_info.hook_addr);
+                    break;
+                case request_op_shadow_hook_clear:
+                    req->status = ls_shadow_clear_exec_hooks(req->tgid);
+                    break;
                 case request_op_kernel_exit:
                 {
                     struct task_struct *task = xchg((struct task_struct **)&ls_process_task, NULL);

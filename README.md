@@ -673,4 +673,3 @@ make -C <KDIR> M=$PWD/lsdriver ARCH=arm64 LLVM=1 modules
 - `-ffunction-sections -fdata-sections`
 
 `DEBUG`、KASAN/UBSAN/KCSAN 关闭、ftrace 插桩移除、强制内联、分支保护关闭等选项保留为注释，需要按目标内核情况自行启用。
-# hook_drive

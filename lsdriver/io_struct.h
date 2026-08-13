@@ -1,5 +1,5 @@
 
-﻿#ifndef IO_STRUCT_H
+#ifndef IO_STRUCT_H
 #define IO_STRUCT_H
 #include <linux/vmalloc.h>
 #include <linux/mm.h>
@@ -21,6 +21,7 @@
 
 #define MOD_NAME_LEN        256
 #define MAX_SEGS_PER_MODULE 512
+#define LS_HOOK_NAME_LEN    64
 
 struct segment_info
 {
@@ -59,12 +60,24 @@ struct virtual_memoryrw
     int size;                    // 读写的大小
 };
 
+struct shadow_hook_request
+{
+    uint64_t hook_addr;                    // 目标函数地址
+    uint64_t field_offset;                 // this + offset
+    uint32_t hit_count;                    // 最近命中次数快照
+    int32_t last_value;                    // 最近一次读取到的字段值
+    char hook_name[LS_HOOK_NAME_LEN];      // 日志标签
+};
+
 enum request_op
 {
     request_op_none,       // 空调用
     request_op_vmem_read,  // 读取内存
     request_op_vmem_write, // 写入内存
     request_op_vmem_info,  // 获取进程内存信息
+    request_op_shadow_hook_add,   // 安装影子执行 hook
+    request_op_shadow_hook_del,   // 卸载指定影子执行 hook
+    request_op_shadow_hook_clear, // 清空进程全部影子执行 hook
 
     request_op_kernel_exit, // 内核线程退出
 
@@ -97,6 +110,8 @@ struct request_obj
     struct virtual_memoryrw vmemrw_info;
     // 虚拟内存信息
     struct virtual_memory vmem_info;
+    // 影子执行 hook 信息
+    struct shadow_hook_request shadow_hook_info;
 };
 
 #endif // IO_STRUCT_H

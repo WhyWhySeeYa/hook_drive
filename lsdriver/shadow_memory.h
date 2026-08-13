@@ -10,9 +10,15 @@
 #include <asm/esr.h>
 #include <asm/ptrace.h>
 
+#include "io_struct.h"
+#include "emulate_insn.h"
 #include "export_fun.h"
 #include "inline_hook_frame.h"
 #include "lsdriver_log.h"
+
+static inline int linear_read_physical(phys_addr_t paddr, void *buffer, size_t size);
+
+#define LS_SHADOW_BRK_INSN 0xD4200000U
 
 enum ls_shadow_state
 {
@@ -38,6 +44,23 @@ struct ls_shadow_page
 static LIST_HEAD(g_ls_shadow_pages);
 static DEFINE_SPINLOCK(g_ls_shadow_pages_lock);
 
+struct ls_shadow_exec_hook
+{
+    struct list_head list;
+    struct mm_struct *mm;
+    uint64_t hook_addr;
+    uint64_t field_offset;
+    uint32_t orig_insn;
+    uint32_t hit_count;
+    int32_t last_value;
+    atomic_t refs;
+    bool dead;
+    char hook_name[LS_HOOK_NAME_LEN];
+};
+
+static LIST_HEAD(g_ls_shadow_exec_hooks);
+static DEFINE_SPINLOCK(g_ls_shadow_exec_hooks_lock);
+
 static inline void ls_shadow_get(struct ls_shadow_page *page)
 {
     atomic_inc(&page->refs);
@@ -52,6 +75,26 @@ static inline void ls_shadow_put(struct ls_shadow_page *page)
     if (page->mm) mmdrop(page->mm);
     if (page->shadow_page) __free_page(page->shadow_page);
     kfree(page);
+}
+
+static inline void ls_shadow_exec_hook_get(struct ls_shadow_exec_hook *hook)
+{
+    atomic_inc(&hook->refs);
+}
+
+static inline void ls_shadow_exec_hook_put(struct ls_shadow_exec_hook *hook)
+{
+    if (!hook) return;
+
+    if (!atomic_dec_and_test(&hook->refs)) return;
+
+    if (hook->mm) mmdrop(hook->mm);
+    kfree(hook);
+}
+
+static inline bool ls_shadow_insn_is_brk(uint32_t insn)
+{
+    return (insn & 0xFFE0001FU) == LS_SHADOW_BRK_INSN;
 }
 
 static inline pteval_t ls_shadow_replace_pfn(pteval_t value, unsigned long pfn)
@@ -100,6 +143,43 @@ static inline pteval_t ls_shadow_make_exec_pte(const struct ls_shadow_page *page
     return value;
 }
 
+static struct ls_shadow_exec_hook *ls_shadow_find_exec_hook(struct mm_struct *mm, uint64_t addr)
+{
+    struct ls_shadow_exec_hook *hook;
+    uint64_t hook_addr = untagged_addr(addr) & ~0x3ULL;
+
+    spin_lock(&g_ls_shadow_exec_hooks_lock);
+    list_for_each_entry(hook, &g_ls_shadow_exec_hooks, list)
+    {
+        if (hook->dead) continue;
+        if (hook->mm != mm) continue;
+        if (hook->hook_addr != hook_addr) continue;
+        ls_shadow_exec_hook_get(hook);
+        spin_unlock(&g_ls_shadow_exec_hooks_lock);
+        return hook;
+    }
+    spin_unlock(&g_ls_shadow_exec_hooks_lock);
+    return NULL;
+}
+
+static void ls_shadow_unlink_exec_hook(struct ls_shadow_exec_hook *hook)
+{
+    bool removed = false;
+
+    if (!hook) return;
+
+    spin_lock(&g_ls_shadow_exec_hooks_lock);
+    if (!hook->dead)
+    {
+        hook->dead = true;
+        list_del_init(&hook->list);
+        removed = true;
+    }
+    spin_unlock(&g_ls_shadow_exec_hooks_lock);
+
+    if (removed) ls_shadow_exec_hook_put(hook);
+}
+
 static struct ls_shadow_page *ls_shadow_find_page(struct mm_struct *mm, uint64_t addr)
 {
     struct ls_shadow_page *page;
@@ -140,7 +220,7 @@ static void ls_shadow_unlink_page(struct ls_shadow_page *page)
 static bool ls_shadow_mapping_is_live(const struct ls_shadow_page *page, struct mm_struct *mm)
 {
     pte_t *ptep;
-    pte_t current;
+    pte_t current_pte;
     unsigned long pfn;
 
     if (!page || !mm) return false;
@@ -148,11 +228,22 @@ static bool ls_shadow_mapping_is_live(const struct ls_shadow_page *page, struct 
     ptep = get_user_pte(mm, page->page_addr);
     if (!ptep) return false;
 
-    current = READ_ONCE(*ptep);
-    if (!pte_present(current) || !pfn_valid(pte_pfn(current))) return false;
+    current_pte = READ_ONCE(*ptep);
+    if (!pte_present(current_pte) || !pfn_valid(pte_pfn(current_pte))) return false;
 
-    pfn = pte_pfn(current);
+    pfn = pte_pfn(current_pte);
     return pfn == page->orig_pfn || pfn == page->shadow_pfn;
+}
+
+static int ls_shadow_force_original_locked(struct ls_shadow_page *page)
+{
+    int status;
+
+    if (!page || page->dead) return -EINVAL;
+
+    status = write_user_pte_value(page->mm, page->page_addr, ls_shadow_make_read_original_pte(page));
+    if (!status) page->state = LS_SHADOW_STATE_ORIGINAL;
+    return status;
 }
 
 static int ls_shadow_switch_to_original_locked(struct ls_shadow_page *page)
@@ -162,9 +253,7 @@ static int ls_shadow_switch_to_original_locked(struct ls_shadow_page *page)
     if (!page || page->dead) return -EINVAL;
     if (page->state == LS_SHADOW_STATE_ORIGINAL) return 0;
 
-    status = write_user_pte_value(page->mm, page->page_addr, ls_shadow_make_read_original_pte(page));
-    if (!status) page->state = LS_SHADOW_STATE_ORIGINAL;
-    return status;
+    return ls_shadow_force_original_locked(page);
 }
 
 static int ls_shadow_switch_to_shadow_locked(struct ls_shadow_page *page)
@@ -196,8 +285,34 @@ static void ls_shadow_release_mm(struct mm_struct *mm)
     struct ls_shadow_page *page;
     struct ls_shadow_page *next;
     LIST_HEAD(release_list);
+    LIST_HEAD(release_hooks);
 
     if (!mm) return;
+
+    spin_lock(&g_ls_shadow_exec_hooks_lock);
+    {
+        struct ls_shadow_exec_hook *hook;
+        struct ls_shadow_exec_hook *next_hook;
+
+        list_for_each_entry_safe(hook, next_hook, &g_ls_shadow_exec_hooks, list)
+        {
+            if (hook->dead || hook->mm != mm) continue;
+            hook->dead = true;
+            list_move_tail(&hook->list, &release_hooks);
+        }
+    }
+    spin_unlock(&g_ls_shadow_exec_hooks_lock);
+
+    {
+        struct ls_shadow_exec_hook *hook;
+        struct ls_shadow_exec_hook *next_hook;
+
+        list_for_each_entry_safe(hook, next_hook, &release_hooks, list)
+        {
+            list_del_init(&hook->list);
+            ls_shadow_exec_hook_put(hook);
+        }
+    }
 
     spin_lock(&g_ls_shadow_pages_lock);
     list_for_each_entry_safe(page, next, &g_ls_shadow_pages, list)
@@ -223,6 +338,32 @@ static void ls_shadow_release_all(void)
     struct ls_shadow_page *page;
     struct ls_shadow_page *next;
     LIST_HEAD(release_list);
+    LIST_HEAD(release_hooks);
+
+    spin_lock(&g_ls_shadow_exec_hooks_lock);
+    {
+        struct ls_shadow_exec_hook *hook;
+        struct ls_shadow_exec_hook *next_hook;
+
+        list_for_each_entry_safe(hook, next_hook, &g_ls_shadow_exec_hooks, list)
+        {
+            if (hook->dead) continue;
+            hook->dead = true;
+            list_move_tail(&hook->list, &release_hooks);
+        }
+    }
+    spin_unlock(&g_ls_shadow_exec_hooks_lock);
+
+    {
+        struct ls_shadow_exec_hook *hook;
+        struct ls_shadow_exec_hook *next_hook;
+
+        list_for_each_entry_safe(hook, next_hook, &release_hooks, list)
+        {
+            list_del_init(&hook->list);
+            ls_shadow_exec_hook_put(hook);
+        }
+    }
 
     spin_lock(&g_ls_shadow_pages_lock);
     list_for_each_entry_safe(page, next, &g_ls_shadow_pages, list)
@@ -360,6 +501,217 @@ static int ls_shadow_write_exec(struct mm_struct *mm, struct vm_area_struct *vma
     return status;
 }
 
+static int ls_shadow_restore_exec_hook_bytes(struct mm_struct *mm, const struct ls_shadow_exec_hook *hook)
+{
+    struct ls_shadow_page *page;
+    void *shadow_kaddr;
+    size_t offset;
+
+    if (!mm || !hook) return -EINVAL;
+
+    page = ls_shadow_find_page(mm, hook->hook_addr);
+    if (!page) return 0;
+
+    spin_lock(&page->lock);
+    if (!page->dead && ls_shadow_mapping_is_live(page, mm))
+    {
+        offset = offset_in_page(hook->hook_addr);
+        shadow_kaddr = page_address(page->shadow_page);
+        __builtin_memcpy((char *)shadow_kaddr + offset, &hook->orig_insn, sizeof(hook->orig_insn));
+        arm64_sync_code_range_all_cpus(shadow_kaddr, PAGE_SIZE);
+    }
+    spin_unlock(&page->lock);
+    ls_shadow_put(page);
+    return 0;
+}
+
+static int ls_shadow_add_exec_hook(pid_t pid, const struct shadow_hook_request *request)
+{
+    struct mm_struct *mm;
+    struct vm_area_struct *vma;
+    struct ls_shadow_page *page;
+    struct ls_shadow_exec_hook *hook;
+    void *shadow_kaddr;
+    uint64_t hook_addr;
+    uint64_t page_addr;
+    size_t offset;
+    int status;
+    bool new_hook = false;
+
+    if (!request) return -EINVAL;
+
+    hook_addr = untagged_addr(request->hook_addr) & ~0x3ULL;
+    page_addr = hook_addr & PAGE_MASK;
+    offset = offset_in_page(hook_addr);
+    if (!hook_addr || offset > PAGE_SIZE - sizeof(uint32_t)) return -EINVAL;
+
+    mm = get_mm_by_pid(pid);
+    if (!mm) return -ESRCH;
+
+    mmap_read_lock(mm);
+    vma = find_vma(mm, hook_addr);
+    if (!vma || hook_addr < vma->vm_start || !(vma->vm_flags & VM_EXEC))
+    {
+        mmap_read_unlock(mm);
+        mmput(mm);
+        return -EFAULT;
+    }
+
+    status = ls_shadow_build_page(mm, vma, page_addr, &page);
+    if (status)
+    {
+        mmap_read_unlock(mm);
+        mmput(mm);
+        return status;
+    }
+
+    hook = ls_shadow_find_exec_hook(mm, hook_addr);
+    if (!hook)
+    {
+        new_hook = true;
+        hook = kzalloc(sizeof(*hook), GFP_KERNEL);
+        if (!hook)
+        {
+            ls_shadow_put(page);
+            mmap_read_unlock(mm);
+            mmput(mm);
+            return -ENOMEM;
+        }
+
+        hook->mm = mm;
+        mmgrab(mm);
+        hook->hook_addr = hook_addr;
+        hook->field_offset = request->field_offset;
+        atomic_set(&hook->refs, 1);
+        INIT_LIST_HEAD(&hook->list);
+        if (request->hook_name[0]) strscpy(hook->hook_name, request->hook_name, sizeof(hook->hook_name));
+        else strscpy(hook->hook_name, "shadow_hook", sizeof(hook->hook_name));
+    }
+    else
+    {
+        hook->field_offset = request->field_offset;
+        if (request->hook_name[0]) strscpy(hook->hook_name, request->hook_name, sizeof(hook->hook_name));
+        else if (!hook->hook_name[0]) strscpy(hook->hook_name, "shadow_hook", sizeof(hook->hook_name));
+    }
+
+    spin_lock(&page->lock);
+    if (page->dead || !ls_shadow_mapping_is_live(page, mm))
+    {
+        spin_unlock(&page->lock);
+        ls_shadow_put(page);
+        ls_shadow_exec_hook_put(hook);
+        mmap_read_unlock(mm);
+        mmput(mm);
+        return -ESTALE;
+    }
+
+    {
+        void *orig_kaddr = page_address(pfn_to_page(page->orig_pfn));
+        if (!orig_kaddr)
+        {
+            spin_unlock(&page->lock);
+            ls_shadow_put(page);
+            ls_shadow_exec_hook_put(hook);
+            mmap_read_unlock(mm);
+            mmput(mm);
+            return -EFAULT;
+        }
+
+        __builtin_memcpy(&hook->orig_insn, (char *)orig_kaddr + offset, sizeof(hook->orig_insn));
+        if (ls_shadow_insn_is_brk(hook->orig_insn))
+        {
+            spin_unlock(&page->lock);
+            ls_shadow_put(page);
+            ls_shadow_exec_hook_put(hook);
+            mmap_read_unlock(mm);
+            mmput(mm);
+            return -EOPNOTSUPP;
+        }
+    }
+
+    shadow_kaddr = page_address(page->shadow_page);
+    __builtin_memcpy((char *)shadow_kaddr + offset, &(uint32_t){LS_SHADOW_BRK_INSN}, sizeof(uint32_t));
+    arm64_sync_code_range_all_cpus(shadow_kaddr, PAGE_SIZE);
+    status = ls_shadow_force_original_locked(page);
+    spin_unlock(&page->lock);
+    ls_shadow_put(page);
+
+    if (!status && new_hook)
+    {
+        spin_lock(&g_ls_shadow_exec_hooks_lock);
+        if (list_empty(&hook->list))
+        {
+            ls_shadow_exec_hook_get(hook);
+            list_add_tail(&hook->list, &g_ls_shadow_exec_hooks);
+        }
+        spin_unlock(&g_ls_shadow_exec_hooks_lock);
+    }
+
+    ls_shadow_exec_hook_put(hook);
+    mmap_read_unlock(mm);
+    mmput(mm);
+    return status;
+}
+
+static int ls_shadow_remove_exec_hook(pid_t pid, uint64_t hook_addr)
+{
+    struct mm_struct *mm;
+    struct ls_shadow_exec_hook *hook;
+    int status = 0;
+
+    hook_addr = untagged_addr(hook_addr) & ~0x3ULL;
+    if (!hook_addr) return -EINVAL;
+
+    mm = get_mm_by_pid(pid);
+    if (!mm) return -ESRCH;
+
+    hook = ls_shadow_find_exec_hook(mm, hook_addr);
+    if (!hook)
+    {
+        mmput(mm);
+        return -ENOENT;
+    }
+
+    mmap_read_lock(mm);
+    status = ls_shadow_restore_exec_hook_bytes(mm, hook);
+    mmap_read_unlock(mm);
+    ls_shadow_unlink_exec_hook(hook);
+    ls_shadow_exec_hook_put(hook);
+    mmput(mm);
+    return status;
+}
+
+static int ls_shadow_clear_exec_hooks(pid_t pid)
+{
+    struct mm_struct *mm;
+    struct ls_shadow_exec_hook *hook;
+    struct ls_shadow_exec_hook *next;
+    LIST_HEAD(release_list);
+
+    mm = get_mm_by_pid(pid);
+    if (!mm) return -ESRCH;
+
+    spin_lock(&g_ls_shadow_exec_hooks_lock);
+    list_for_each_entry_safe(hook, next, &g_ls_shadow_exec_hooks, list)
+    {
+        if (hook->dead || hook->mm != mm) continue;
+        hook->dead = true;
+        list_move_tail(&hook->list, &release_list);
+    }
+    spin_unlock(&g_ls_shadow_exec_hooks_lock);
+
+    mmap_read_lock(mm);
+    list_for_each_entry_safe(hook, next, &release_list, list)
+    {
+        list_del_init(&hook->list);
+        ls_shadow_restore_exec_hook_bytes(mm, hook);
+        ls_shadow_exec_hook_put(hook);
+    }
+    mmap_read_unlock(mm);
+    mmput(mm);
+    return 0;
+}
+
 static int ls_shadow_read_original(struct mm_struct *mm, uint64_t addr, void *buffer, size_t size)
 {
     struct ls_shadow_page *page;
@@ -453,6 +805,85 @@ static int ls_shadow_mem_abort_hook_work(struct pt_regs *hook_regs)
     return status ? 0 : 1;
 }
 
+static int ls_shadow_brk_hook_work(struct pt_regs *hook_regs)
+{
+    struct pt_regs *regs;
+    struct ls_shadow_exec_hook *hook;
+    struct fp_regs fp_regs;
+    uint64_t hook_pc;
+    uint64_t self_addr;
+    uint64_t field_addr;
+    unsigned long esr;
+    int32_t value = 0;
+    int status;
+
+    if (!hook_regs) return 0;
+
+    regs = (struct pt_regs *)hook_regs->regs[2];
+    if (!regs || !current->mm || !user_mode(regs)) return 0;
+
+    esr = hook_regs->regs[1];
+    if (ESR_ELx_EC(esr) != ESR_ELx_EC_BRK64) return 0;
+
+    hook_pc = untagged_addr(regs->pc) & ~0x3ULL;
+    hook = ls_shadow_find_exec_hook(current->mm, hook_pc);
+    if (!hook) return 0;
+
+    self_addr = untagged_addr(regs->regs[0]);
+    field_addr = self_addr + hook->field_offset;
+    status = copy_from_user_inatomic_nofault(&value, (const void __user *)field_addr, sizeof(value));
+    if (!status)
+    {
+        hook->last_value = value;
+        hook->hit_count++;
+        ls_log_tag("hook", "[%s] pc=0x%llx self=0x%llx value=%d hit=%u\n",
+                   hook->hook_name[0] ? hook->hook_name : "shadow_hook",
+                   (unsigned long long)hook_pc,
+                   (unsigned long long)self_addr,
+                   value,
+                   hook->hit_count);
+    }
+    else
+    {
+        ls_log_tag("hook", "[%s] pc=0x%llx self=0x%llx read failed: %d\n",
+                   hook->hook_name[0] ? hook->hook_name : "shadow_hook",
+                   (unsigned long long)hook_pc,
+                   (unsigned long long)self_addr,
+                   status);
+    }
+
+    for (int qreg = 0; qreg < ARM64_FP_Q_REG_COUNT; qreg++) read_q_reg(qreg, &fp_regs.q[qreg]);
+    if (!emulate_insn(regs, &fp_regs, hook->orig_insn))
+    {
+        struct ls_shadow_page *page = ls_shadow_find_page(current->mm, hook_pc);
+        if (page)
+        {
+            spin_lock(&page->lock);
+            if (!page->dead && ls_shadow_mapping_is_live(page, current->mm))
+            {
+                void *shadow_kaddr = page_address(page->shadow_page);
+                size_t offset = offset_in_page(hook_pc);
+                __builtin_memcpy((char *)shadow_kaddr + offset, &hook->orig_insn, sizeof(hook->orig_insn));
+                arm64_sync_code_range_all_cpus(shadow_kaddr, PAGE_SIZE);
+            }
+            spin_unlock(&page->lock);
+            ls_shadow_put(page);
+        }
+
+        ls_log_tag("hook", "[%s] emulate failed at 0x%llx, hook disabled\n",
+                   hook->hook_name[0] ? hook->hook_name : "shadow_hook",
+                   (unsigned long long)hook_pc);
+        ls_shadow_unlink_exec_hook(hook);
+        ls_shadow_exec_hook_put(hook);
+        return 1;
+    }
+
+    for (int qreg = 0; qreg < ARM64_FP_Q_REG_COUNT; qreg++) write_q_reg(qreg, &fp_regs.q[qreg]);
+    hook_regs->regs[0] = 0;
+    ls_shadow_exec_hook_put(hook);
+    return 1;
+}
+
 static int ls_shadow_exit_mmap_hook_work(struct pt_regs *hook_regs)
 {
     if (!hook_regs) return 0;
@@ -462,6 +893,7 @@ static int ls_shadow_exit_mmap_hook_work(struct pt_regs *hook_regs)
 
 static struct hook_entry ls_shadow_hooks[] = {
     HOOK_ENTRY("do_mem_abort", ls_shadow_mem_abort_hook_work),
+    HOOK_ENTRY("brk_handler", ls_shadow_brk_hook_work),
     HOOK_ENTRY("exit_mmap", ls_shadow_exit_mmap_hook_work),
 };
 
