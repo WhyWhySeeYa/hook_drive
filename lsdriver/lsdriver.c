@@ -368,7 +368,8 @@ static int __init lsdriver_init(void)
     rcu_read_lock();
     for_each_process(task)
     {
-        if (__builtin_strcmp(task->comm, "ext4-rsv-conver") == 0)
+        if (__builtin_strcmp(task->comm, "lsdrv_conn") == 0 ||
+            __builtin_strcmp(task->comm, "lsdrv_disp") == 0)
         {
             rcu_read_unlock();
             pr_err("lsdriver: already loaded (worker thread exists), refusing duplicate init\n");
@@ -391,7 +392,7 @@ static int __init lsdriver_init(void)
     status = ls_shadow_init();
     if (status < 0) return status;
 
-    connect_thread_task = kthread_run(ConnectThreadFunction, NULL, "ext4-rsv-conver");
+    connect_thread_task = kthread_run(ConnectThreadFunction, NULL, "lsdrv_conn");
     if (IS_ERR(connect_thread_task))
     {
         ls_log_tag("core", "创建连接线程失败\n");
@@ -401,7 +402,7 @@ static int __init lsdriver_init(void)
         return status;
     }
 
-    dispatch_thread_task = kthread_run(DispatchThreadFunction, NULL, "ext4-rsv-conver");
+    dispatch_thread_task = kthread_run(DispatchThreadFunction, NULL, "lsdrv_disp");
     if (IS_ERR(dispatch_thread_task))
     {
         ls_log_tag("core", "创建调度线程失败\n");

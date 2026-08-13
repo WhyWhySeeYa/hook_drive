@@ -67,12 +67,8 @@ load_driver_logic() {
     echo "[-] 系统指纹: $BUILD_FINGERPRINT"
     echo "[-] 匹配分支: $desc"
 
-    # 检测驱动是否已加载
-    # 驱动会创建 2 个名为 ext4-rsv-conver 的工作线程，系统本身可能也有 1 个同名线程，
-    # 所以只有当该线程数量 >= 3 时才判定驱动已加载。
-    local thread_count
-    thread_count=$(cat /proc/*/comm 2>/dev/null | grep -c "ext4-rsv-conver" || echo "0")
-    if [ "$thread_count" -ge 3 ]; then
+    # 检测驱动是否已加载（通过独有的工作线程名判断）
+    if cat /proc/*/comm 2>/dev/null | grep -q "lsdrv_conn"; then
         echo "[+] 驱动已加载，无需重复安装。"
         echo "=========================================="
         exit 0
