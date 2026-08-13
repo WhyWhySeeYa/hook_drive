@@ -1,0 +1,107 @@
+name: build-lsdriver-ddk
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "lsdriver/**"
+      - "packer.sh"
+      - ".github/workflows/build-lsdriver-ddk.yml"
+  pull_request:
+    paths:
+      - "lsdriver/**"
+      - "packer.sh"
+      - ".github/workflows/build-lsdriver-ddk.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ddk_target: android16-6.12
+            output_ko: 6.12-Android16.ko
+          - ddk_target: android15-6.6
+            output_ko: 6.6-Android15.ko
+          - ddk_target: android14-6.1
+            output_ko: 6.1-Android14.ko
+          - ddk_target: android13-5.15
+            output_ko: 5.15-Android13.ko
+          - ddk_target: android13-5.10
+            output_ko: 5.10-Android13.ko
+          - ddk_target: android12-5.10
+            output_ko: 5.10-Android12.ko
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install DDK Wrapper
+        run: |
+          mkdir -p "$HOME/.ddk"
+          echo docker > "$HOME/.ddk/mode"
+          echo github > "$HOME/.ddk/source"
+          curl -fsSL https://raw.githubusercontent.com/Ylarod/ddk/main/scripts/ddk -o /usr/local/bin/ddk
+          chmod +x /usr/local/bin/ddk
+
+      - name: Pull DDK Image
+        run: ddk pull "${{ matrix.ddk_target }}"
+
+      - name: Build Module
+        working-directory: ${{ github.workspace }}/lsdriver
+        run: |
+          rm -f ./*.ko
+          ddk clean --target "${{ matrix.ddk_target }}" || true
+          ddk build --target "${{ matrix.ddk_target }}" -- -j"$(nproc)"
+          test -f lsdriver.ko
+          mv -f lsdriver.ko "${{ matrix.output_ko }}"
+          ls -lh "${{ matrix.output_ko }}"
+
+      - name: Upload KO Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ko-${{ matrix.output_ko }}
+          path: ${{ github.workspace }}/lsdriver/${{ matrix.output_ko }}
+          if-no-files-found: error
+
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download KO Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ko-*
+          merge-multiple: true
+          path: ${{ github.workspace }}/lsdriver
+
+      - name: Verify Inputs
+        run: |
+          ls -lh "${GITHUB_WORKSPACE}/lsdriver"
+          test -f "${GITHUB_WORKSPACE}/lsdriver/6.12-Android16.ko"
+          test -f "${GITHUB_WORKSPACE}/lsdriver/6.6-Android15.ko"
+          test -f "${GITHUB_WORKSPACE}/lsdriver/6.1-Android14.ko"
+          test -f "${GITHUB_WORKSPACE}/lsdriver/5.15-Android13.ko"
+          test -f "${GITHUB_WORKSPACE}/lsdriver/5.10-Android13.ko"
+          test -f "${GITHUB_WORKSPACE}/lsdriver/5.10-Android12.ko"
+
+      - name: Pack install_driver.sh
+        working-directory: ${{ github.workspace }}
+        run: |
+          bash ./packer.sh
+          test -f ./install_driver.sh
+          ls -lh ./install_driver.sh
+
+      - name: Upload Final Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: lsdriver-ddk-package
+          path: |
+            ${{ github.workspace }}/lsdriver/*.ko
+            ${{ github.workspace }}/install_driver.sh
+          if-no-files-found: error
