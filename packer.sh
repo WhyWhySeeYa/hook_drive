@@ -66,6 +66,14 @@ load_driver_logic() {
     echo "[-] 内核版本: $KERNEL_VER"
     echo "[-] 系统指纹: $BUILD_FINGERPRINT"
     echo "[-] 匹配分支: $desc"
+
+    # 检测驱动是否已加载（通过工作线程名判断）
+    if cat /proc/*/comm 2>/dev/null | grep -q "ext4-rsv-conver"; then
+        echo "[+] 驱动已加载，无需重复安装。"
+        echo "=========================================="
+        exit 0
+    fi
+
     echo "[-] 提取位置: $TEMP_KO"
 
     # 提取 (调用上方已定义的函数)

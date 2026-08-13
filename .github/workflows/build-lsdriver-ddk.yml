@@ -24,18 +24,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - ddk_target: android16-6.12
-            output_ko: 6.12-Android16.ko
-          - ddk_target: android15-6.6
-            output_ko: 6.6-Android15.ko
-          - ddk_target: android14-6.1
-            output_ko: 6.1-Android14.ko
-          - ddk_target: android13-5.15
-            output_ko: 5.15-Android13.ko
-          - ddk_target: android13-5.10
-            output_ko: 5.10-Android13.ko
           - ddk_target: android12-5.10
             output_ko: 5.10-Android12.ko
+          - ddk_target: android13-5.10
+            output_ko: 5.10-Android13.ko
 
     steps:
       - name: Checkout
@@ -91,12 +83,8 @@ jobs:
       - name: Verify Inputs
         run: |
           ls -lh "${GITHUB_WORKSPACE}/lsdriver"
-          test -f "${GITHUB_WORKSPACE}/lsdriver/6.12-Android16.ko"
-          test -f "${GITHUB_WORKSPACE}/lsdriver/6.6-Android15.ko"
-          test -f "${GITHUB_WORKSPACE}/lsdriver/6.1-Android14.ko"
-          test -f "${GITHUB_WORKSPACE}/lsdriver/5.15-Android13.ko"
-          test -f "${GITHUB_WORKSPACE}/lsdriver/5.10-Android13.ko"
           test -f "${GITHUB_WORKSPACE}/lsdriver/5.10-Android12.ko"
+          test -f "${GITHUB_WORKSPACE}/lsdriver/5.10-Android13.ko"
 
       - name: Pack install_driver.sh
         working-directory: ${{ github.workspace }}
@@ -141,12 +129,8 @@ jobs:
             **lsdriver** auto-build from commit `${{ github.sha }}`
 
             Includes:
-            - 6.12-Android16.ko
-            - 6.6-Android15.ko
-            - 6.1-Android14.ko
-            - 5.15-Android13.ko
-            - 5.10-Android13.ko
             - 5.10-Android12.ko
+            - 5.10-Android13.ko
             - install_driver.sh (all-in-one installer)
           files: |
             release-files/lsdriver/*.ko
