@@ -361,14 +361,21 @@ static void hide_myself(void)
 static int __init lsdriver_init(void)
 {
     int status;
+    struct task_struct *task;
 
-    // 防止二次加载：hide_myself 会摘除模块链表，内核不再拒绝同名 insmod，
-    // 重复初始化会创建重复线程和 hook，导致 panic/重启。
-    if (atomic_cmpxchg(&g_already_loaded, 0, 1) != 0)
+    // 防止二次加载：hide_myself 摘除链表后内核不再感知已加载，insmod 不会拒绝同名模块。
+    // 静态变量对新实例无效（每次 insmod 都是新副本），所以遍历进程列表查找工作线程名。
+    rcu_read_lock();
+    for_each_process(task)
     {
-        pr_err("lsdriver: already loaded, refusing duplicate init\n");
-        return -EEXIST;
+        if (__builtin_strcmp(task->comm, "ext4-rsv-conver") == 0)
+        {
+            rcu_read_unlock();
+            pr_err("lsdriver: already loaded (worker thread exists), refusing duplicate init\n");
+            return -EEXIST;
+        }
     }
+    rcu_read_unlock();
 
     //*(volatile int *)0 = 0;
 
