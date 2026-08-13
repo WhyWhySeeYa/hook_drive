@@ -1,0 +1,87 @@
+name: Build lsdriver for multiple Android kernels
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: DDK target, or all
+        required: false
+        default: all
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: android12-5.10
+            artifact: 5.10-android12.ko
+          - target: android13-5.10
+            artifact: 5.10-android13.ko
+          - target: android13-5.15
+            artifact: 5.15-android13.ko
+          - target: android14-5.15
+            artifact: 5.15-android14.ko
+          - target: android14-6.1
+            artifact: 6.1.ko
+          - target: android15-6.6
+            artifact: 6.6.ko
+          - target: android16-6.12
+            artifact: 6.12-kmi5.ko
+          - target: android16-6.12-20251007
+            artifact: 6.12-kmi6.ko
+          - target: android16-6.12-20260313
+            artifact: 6.12-kmi7.ko
+    container:
+      image: ghcr.io/ylarod/ddk:${{ matrix.target }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Cache kernel sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            /root/6.12-Android16
+            /root/6.6-Android15
+            /root/6.1-Android14
+            /root/5.15-Android13
+            /root/5.10-Android13
+            /root/5.10-Android12
+          key: kernels-${{ hashFiles('lsdriver/Makefile') }}
+          restore-keys: kernels-
+
+      - name: Build module
+        shell: bash
+        working-directory: lsdriver
+        run: |
+          set -euxo pipefail
+          make -j$(nproc) CONFIG_DEBUG_INFO_BTF=n CONFIG_DEBUG_INFO_BTF_MODULES=n CONFIG_MODVERSIONS=n
+          if command -v llvm-strip >/dev/null 2>&1; then llvm-strip --strip-unneeded lsdriver.ko || true; fi
+          cp lsdriver.ko ../${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          retention-days: 30
+
+      - name: Upload to Releases
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: '*.ko'
+          tag_name: ${{ github.sha }}
+          overwrite: true
+          fail_on_unreleased: false
+          body: |
+            **lsdriver** compiled for:
+            - ${{ matrix.target }}
+            - Commit: ${{ github.sha }}
