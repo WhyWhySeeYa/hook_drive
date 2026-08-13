@@ -13,6 +13,10 @@ on:
       - "packer.sh"
       - ".github/workflows/build-lsdriver-ddk.yml"
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -109,3 +113,43 @@ jobs:
             ${{ github.workspace }}/lsdriver/*.ko
             ${{ github.workspace }}/install_driver.sh
           if-no-files-found: error
+
+  release:
+    needs: package
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Package Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: lsdriver-ddk-package
+          path: release-files
+
+      - name: Generate release tag
+        id: tag
+        run: echo "tag=v$(date +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "lsdriver ${{ steps.tag.outputs.tag }}"
+          body: |
+            **lsdriver** auto-build from commit `${{ github.sha }}`
+
+            Includes:
+            - 6.12-Android16.ko
+            - 6.6-Android15.ko
+            - 6.1-Android14.ko
+            - 5.15-Android13.ko
+            - 5.10-Android13.ko
+            - 5.10-Android12.ko
+            - install_driver.sh (all-in-one installer)
+          files: |
+            release-files/lsdriver/*.ko
+            release-files/install_driver.sh
+          draft: false
+          prerelease: false

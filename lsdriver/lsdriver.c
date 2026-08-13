@@ -27,6 +27,9 @@ static struct page **req_pages = NULL;
 static int req_num_pages = 0;
 static atomic_t g_dispatch_busy = ATOMIC_INIT(0);
 
+// 防止模块被二次加载（hide_myself 摘除链表后内核不再感知已加载，insmod 不会拒绝同名模块）
+static atomic_t g_already_loaded = ATOMIC_INIT(0);
+
 /*
 volatile 是对象级约束，这三个指针的每次读写都按易变访问处理，适合在线程循环中持续轮询生命周期状态。
 READ_ONCE/WRITE_ONCE 是访问级约束，只约束指定位置的一次标量访问，适合读取共享字段快照且不影响其它受锁访问的优化。
@@ -358,6 +361,14 @@ static void hide_myself(void)
 static int __init lsdriver_init(void)
 {
     int status;
+
+    // 防止二次加载：hide_myself 会摘除模块链表，内核不再拒绝同名 insmod，
+    // 重复初始化会创建重复线程和 hook，导致 panic/重启。
+    if (atomic_cmpxchg(&g_already_loaded, 0, 1) != 0)
+    {
+        pr_err("lsdriver: already loaded, refusing duplicate init\n");
+        return -EEXIST;
+    }
 
     //*(volatile int *)0 = 0;
 
