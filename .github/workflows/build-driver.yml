@@ -31,9 +31,9 @@ jobs:
           - target: android14-5.15
             artifact: 5.15-android14.ko
           - target: android14-6.1
-            artifact: 6.1.ko
+            artifact: 6.1-android14.ko
           - target: android15-6.6
-            artifact: 6.6.ko
+            artifact: 6.6-android15.ko
           - target: android16-6.12
             artifact: 6.12-kmi5.ko
           - target: android16-6.12-20251007
@@ -53,9 +53,12 @@ jobs:
         working-directory: lsdriver
         run: |
           set -euxo pipefail
-          make -j$(nproc) CONFIG_DEBUG_INFO_BTF=n CONFIG_DEBUG_INFO_BTF_MODULES=n CONFIG_MODVERSIONS=n
-          if command -v llvm-strip >/dev/null 2>&1; then llvm-strip --strip-unneeded lsdriver.ko || true; fi
-          cp lsdriver.ko ../${{ matrix.artifact }}
+          rm -f ./*.ko
+          ddk clean --target "${{ matrix.target }}" || true
+          ddk build --target "${{ matrix.target }}" -- -j"$(nproc)"
+          test -f lsdriver.ko
+          mv -f lsdriver.ko ../${{ matrix.artifact }}
+          ls -lh ../${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
